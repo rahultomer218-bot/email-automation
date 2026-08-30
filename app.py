@@ -1,144 +1,200 @@
+import base64
+import json
 import os
-import shutil
-import subprocess
-import sys
-import streamlit as st
-
-# Streamlit Page Config
-st.set_page_config(
-    page_title="AI Email Automator",
-    page_icon="✉️",
-    layout="centered"
-)
-
-# Pre-configured Groq Key (Hidden from User UI)
-import os
+import time
+from email.mime.application import MIMEApplication
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
 from groq import Groq
 
-# यह स्वचालित रूप से सर्वर या सिस्टम के Environment Variable से Key उठाएगा
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+# --- CONFIGURATION ---
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")  
+RESUME_PATH = "resume.pdf"
+POLL_INTERVAL_SECONDS = 30  # Har 30 seconds me check karega
 
-# Custom CSS for UI styling
-st.markdown("""
-    <style>
-    .main-header {
-        text-align: center;
-        padding: 10px;
-    }
-    .status-card {
-        background-color: #f0f2f6;
-        padding: 15px;
-        border-radius: 10px;
-        margin-top: 15px;
-    }
-    </style>
-""", unsafe_allow_html=True)
+SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
 
-# Top Logo Header
-st.markdown("""
-    <div class="main-header">
-        <img src="https://upload.wikimedia.org/wikipedia/commons/7/7e/Gmail_icon_%282020%29.svg" width="120" style="margin-bottom: 15px;">
-        <h1>AI Gmail Assistant</h1>
-        <p style="color: gray; font-size: 16px;">Automate your email job applications with AI precision</p>
-    </div>
-""", unsafe_allow_html=True)
+groq_client = Groq(api_key=GROQ_API_KEY)
 
-st.divider()
 
-# Section 1: Resume Management
-st.subheader("📄 Resume Settings")
-st.write("Upload your resume. If you upload a new one, it will automatically replace the existing one.")
+def get_gmail_service():
+    """Authenticates the user and returns the Gmail API service object."""
+    creds = None
+    if os.path.exists("token.json"):
+        creds = Credentials.from_authorized_user_file("token.json", SCOPES)
 
-uploaded_file = st.file_uploader("Upload or Update Resume (PDF)", type=["pdf"])
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            print("Error: token.json missing or invalid on server.")
+            return None
 
-if uploaded_file is not None:
-    # Save/Replace the resume as resume.pdf locally
-    with open("resume.pdf", "wb") as f:
-        f.write(uploaded_file.getbuffer())
-    st.success(f"✅ Resume successfully updated: **{uploaded_file.name}**")
-elif os.path.exists("resume.pdf"):
-    st.info("ℹ️ Active Resume: **resume.pdf** is currently set for auto-replies.")
-else:
-    st.warning("⚠️ No resume found. Please upload a PDF resume to enable job auto-replies.")
+    return build("gmail", "v1", credentials=creds)
 
-st.divider()
-# Section 3: Detailed Live Activity Log
-st.subheader("📊 Live Activity & Email Log")
 
-if os.path.exists("activity_log.txt"):
-    with open("activity_log.txt", "r", encoding="utf-8") as log_file:
-        logs = log_file.readlines()
-        
-    if logs:
-        # Filter options
-        filter_option = st.selectbox(
-            "Filter History by Action:",
-            ["All Activities", "Resumes Sent Only", "Trashed Emails Only"]
+def classify_email(sender, subject, body):
+    """Uses Groq API to categorize the email into strict JSON."""
+    prompt = f"""
+    Analyze the following email and classify it into EXACTLY ONE category:
+    - PROMOTIONAL (Spam, newsletters, marketing, ads, discounts)
+    - JOB_OPPORTUNITY (Recruiters, interview calls, job offers, career inquiries)
+    - OTHER (Personal emails, transactional receipts, general notifications)
+
+    Sender: {sender}
+    Subject: {subject}
+    Body: {body[:1000]}
+
+    Return ONLY a JSON object in this exact format, with no additional text:
+    {{"category": "PROMOTIONAL" | "JOB_OPPORTUNITY" | "OTHER"}}
+    """
+
+    try:
+        response = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",  # Correct Active Groq Model
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            response_format={"type": "json_object"},
         )
+        data = json.loads(response.choices[0].message.content)
+        return data.get("category", "OTHER")
+    except Exception as e:
+        print(f"Error classifying email with AI: {e}")
+        return "OTHER"
+
+
+def send_auto_reply(service, thread_id, to_email, original_subject):
+    """Sends an automated reply email with the resume PDF attached and logs the result."""
+    message = MIMEMultipart()
+    message["To"] = to_email
+    message["Subject"] = (
+        f"Re: {original_subject}"
+        if not original_subject.lower().startswith("re:")
+        else original_subject
+    )
+
+    body_text = (
+        "Hello,\n\n"
+        "Thank you for reaching out regarding this job opportunity! "
+        "Please find my attached resume for your consideration.\n\n"
+        "Best regards,\nRahul Tomer"
+    )
+    message.attach(MIMEText(body_text, "plain"))
+
+    # Attach PDF Resume
+    if os.path.exists(RESUME_PATH):
+        with open(RESUME_PATH, "rb") as f:
+            pdf_attachment = MIMEApplication(f.read(), _subtype="pdf")
+            pdf_attachment.add_header(
+                "Content-Disposition",
+                "attachment",
+                filename=os.path.basename(RESUME_PATH),
+            )
+            message.attach(pdf_attachment)
+
+    raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
+    body = {"raw": raw_message, "threadId": thread_id}
+
+    try:
+        sent_message = service.users().messages().send(userId="me", body=body).execute()
         
-        filtered_logs = logs
-        if filter_option == "Resumes Sent Only":
-            filtered_logs = [line for line in logs if "SENT RESUME" in line]
-        elif filter_option == "Trashed Emails Only":
-            filtered_logs = [line for line in logs if "TRASHED" in line]
+        print(f"✅ Success: Resume sent to {to_email} | Message ID: {sent_message['id']}")
+        
+        with open("activity_log.txt", "a", encoding="utf-8") as f:
+            f.write(f"[{time.ctime()}] SENT RESUME TO: {to_email} | Subject: {original_subject} | Message ID: {sent_message['id']}\n")
 
-        # Display latest logs on top
-        st.text_area(
-            label="Log Output (Latest Actions on Top)",
-            value="".join(reversed(filtered_logs[-30:])),
-            height=250
+    except Exception as e:
+        print(f"❌ Failed to send resume to {to_email}: {e}")
+
+
+def process_unread_emails(service):
+    """Fetches and handles unread inbox emails."""
+    results = (
+        service.users()
+        .messages()
+        .list(userId="me", q="is:unread in:inbox")
+        .execute()
+    )
+    messages = results.get("messages", [])
+
+    if not messages:
+        print("No new unread emails.")
+        return
+
+    print(f"Found {len(messages)} unread email(s)...")
+
+    for msg_info in messages:
+        msg_id = msg_info["id"]
+        msg = (
+            service.users()
+            .messages()
+            .get(userId="me", id=msg_id, format="full")
+            .execute()
         )
-    else:
-        st.info("No activity logged yet.")
-else:
-    st.info("Activity log will appear here as soon as emails are processed.")
-# Section 2: Automation Control Box
-st.subheader("⚡ Automation Control")
 
-col1, col2 = st.columns(2)
+        thread_id = msg.get("threadId")
+        payload = msg.get("payload", {})
+        headers = payload.get("headers", [])
 
-# Global Session State to track background process
-if "process" not in st.session_state:
-    st.session_state.process = None
+        sender = next(
+            (h["value"] for h in headers if h["name"].lower() == "from"),
+            "Unknown",
+        )
+        subject = next(
+            (h["value"] for h in headers if h["name"].lower() == "subject"),
+            "No Subject",
+        )
 
-with col1:
-    if st.button("🚀 Start Automator", use_container_width=True, type="primary"):
-        if not os.path.exists("resume.pdf"):
-            st.error("Please upload a resume first!")
-        elif st.session_state.process is None:
-            # Start email_automator.py in background
-            st.session_state.process = subprocess.Popen([sys.executable, "email_automator.py"])
-            st.toast("Email Automator Started!", icon="✅")
-        else:
-            st.info("Automator is already running.")
+        body = msg.get("snippet", "")
 
-with col2:
-    if st.button("🛑 Stop Automator", use_container_width=True):
-        if st.session_state.process is not None:
-            st.session_state.process.terminate()
-            st.session_state.process = None
-            st.toast("Email Automator Stopped.", icon="🛑")
-        else:
-            st.info("Automator is not running.")
+        print(f"\nProcessing Email: '{subject}' from {sender}")
 
-# Status Display
-st.markdown("<br>", unsafe_allow_html=True)
-if st.session_state.process is not None:
-    st.success("🟢 **Status:** Active & Listening for incoming emails every 5 minutes...")
-else:
-    st.error("🔴 **Status:** Inactive (Click 'Start Automator' to launch)")
+        category = classify_email(sender, subject, body)
+        print(f"   -> AI Classification: {category}")
 
-st.divider()
+        if category == "PROMOTIONAL":
+            service.users().messages().trash(userId="me", id=msg_id).execute()
+            print("  Action: Email moved to TRASH.")
+            with open("activity_log.txt", "a", encoding="utf-8") as f:
+                f.write(f"[{time.ctime()}] 🗑️ TRASHED (Spam/Promo): {subject} | From: {sender}\n")
 
-# Section 3: Live Logs Viewer
-st.subheader("📊 Recent Activity Log")
+        elif category == "JOB_OPPORTUNITY":
+            send_auto_reply(service, thread_id, sender, subject)
+            service.users().messages().batchModify(
+                userId="me",
+                body={"ids": [msg_id], "removeLabelIds": ["UNREAD"]},
+            ).execute()
+            print("  Action: Resume sent & marked as read.")
 
-if os.path.exists("activity_log.txt"):
-    with open("activity_log.txt", "r", encoding="utf-8") as log_file:
-        logs = log_file.readlines()
-        if logs:
-            st.text_area("Sent Resume History", "".join(reversed(logs[-15:])), height=200)
-        else:
-            st.write("No resumes sent yet.")
-else:
-    st.write("Activity log file will be generated once the first email is processed.")
+        else:  # OTHER
+            service.users().messages().batchModify(
+                userId="me",
+                body={"ids": [msg_id], "removeLabelIds": ["UNREAD"]},
+            ).execute()
+            print("  Action: Marked as read.")
+            with open("activity_log.txt", "a", encoding="utf-8") as f:
+                f.write(f"[{time.ctime()}] 📖 MARKED READ (Other): {subject} | From: {sender}\n")
+
+
+def main():
+    service = get_gmail_service()
+    if not service:
+        print("Gmail authentication failed. Exiting...")
+        return
+
+    print("Email Automator Active. Listening for incoming messages every 30 seconds...")
+
+    while True:
+        try:
+            process_unread_emails(service)
+        except Exception as e:
+            print(f"An error occurred during polling: {e}")
+
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+
+if __name__ == "__main__":
+    main()
