@@ -90,6 +90,21 @@ if not st.session_state.authenticated:
 else:
     # --- LOGGED IN DASHBOARD & AUTOMATION CONTROL ---
     st.sidebar.success(f"Logged in as:\n**{st.session_state.user_email}**")
+    
+    # --- RESUME UPLOAD SECTION (Sidebar) ---
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("📄 Upload Your Resume")
+    uploaded_file = st.sidebar.file_uploader("Choose a PDF file", type=["pdf"])
+    if uploaded_file is not None:
+        with open(RESUME_PATH, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+        st.sidebar.success("✅ Resume uploaded successfully!")
+    elif os.path.exists(RESUME_PATH):
+        st.sidebar.info("ℹ️ Active Resume: `resume.pdf` attached.")
+    else:
+        st.sidebar.warning("⚠️ No resume found. Please upload one.")
+
+    st.sidebar.markdown("---")
     if st.sidebar.button("Logout"):
         st.session_state.authenticated = False
         st.session_state.user_email = ""
@@ -159,6 +174,8 @@ else:
                 pdf = MIMEApplication(f.read(), _subtype="pdf")
                 pdf.add_header("Content-Disposition", "attachment", filename="Rahul_Tomer_Resume.pdf")
                 msg.attach(pdf)
+        else:
+            st.warning("⚠️ Sending email without resume as no file was uploaded.")
 
         raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
         try:
